@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""Turn Alertmanager webhooks into GNOME desktop notifications.
+
+Runs as a systemd --user service so it inherits the login session's D-Bus
+address; notify-send is useless without it. Stdlib only, so there is no
+virtualenv to keep alive across OS upgrades.
+
+Alertmanager POSTs a v4 payload: one JSON object per notification group, with
+an `alerts` array inside it. Each alert is either firing or resolved.
+"""
+
+import json
+import os
+import subprocess
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+LISTEN_HOST = os.environ.get("ALERT_NOTIFY_HOST", "0.0.0.0")
+LISTEN_PORT = int(os.environ.get("ALERT_NOTIFY_PORT", "9099"))
+
+# Optional shared secret. Unset means no auth, which is fine on a trusted LAN
+# behind a firewall rule — but anything that can reach the port can then post
+# arbitrary desktop notifications, so set it if that bothers you.
+TOKEN = os.environ.get("ALERT_NOTIFY_TOKEN", "")
+
+# Prometheus `severity` label -> notify-send urgency. `critical` is the one
+# that matters: GNOME keeps critical notifications on screen until dismissed
+# instead of timing out, which is the whole point of routing them here.
+URGENCY = {"critical": "critical", "warning": "normal", "info": "low"}
+
+ICON = {
+    "critical": "dialog-error",
+    "warning": "dialog-warning",
+    "info": "dialog-information",
+}
+
+# fingerprint -> notification id, so a resolved alert replaces its own firing
+# notification in place rather than stacking a second one next to it.
+_ids = {}
+_lock = threading.Lock()
+
+
+def notify(alert):
+    labels = alert.get("labels", {})
+    annotations = alert.get("annotations", {})
+    resolved = alert.get("status") == "resolved"
+
+    name = labels.get("alertname", "alert")
+    severity = labels.get("severity", "info")
+
+    # Whatever identifies the thing that broke. First match wins, so put the
+    # most specific label first; `instance` is the near-universal fallback.
+    where = labels.get("node") or labels.get("app") or labels.get("instance")
+
+    title = f"[RESOLVED] {name}" if resolved else f"{name}"
+    if where:
+        title += f" — {where}"
+
+    body = annotations.get("description") or annotations.get("summary") or ""
+
+    # A resolved critical shouldn't demand a click to dismiss.
+    urgency = "low" if resolved else URGENCY.get(severity, "normal")
+    icon = "emblem-ok-symbolic" if resolved else ICON.get(severity, "dialog-information")
+
+    cmd = [
+        "notify-send",
+        "--app-name=Alertmanager",
+        f"--urgency={urgency}",
+        f"--icon={icon}",
+        "--print-id",
+    ]
+
+    fingerprint = alert.get("fingerprint", "")
+    with _lock:
+        prior = _ids.get(fingerprint)
+    if prior:
+        cmd.append(f"--replace-id={prior}")
+
+    cmd += [title, body]
+
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"notify-send failed: {exc}", file=sys.stderr, flush=True)
+        return
+
+    if out.returncode != 0:
+        print(f"notify-send exit {out.returncode}: {out.stderr.strip()}",
+              file=sys.stderr, flush=True)
+        return
+
+    with _lock:
+        if resolved:
+            # Keep the id around and it leaks; the alert is over.
+            _ids.pop(fingerprint, None)
+        elif fingerprint and out.stdout.strip().isdigit():
+            _ids[fingerprint] = out.stdout.strip()
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        if TOKEN and self.headers.get("Authorization") != f"Bearer {TOKEN}":
+            self.send_response(401)
+            self.end_headers()
+            return
+
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            payload = json.loads(self.rfile.read(length) or b"{}")
+        except json.JSONDecodeError as exc:
+            print(f"bad payload: {exc}", file=sys.stderr, flush=True)
+            self.send_response(400)
+            self.end_headers()
+            return
+
+        # Answer before notifying. Alertmanager retries on a slow reply, and a
+        # retry here means the same alert pops twice.
+        self.send_response(200)
+        self.end_headers()
+
+        for alert in payload.get("alerts", []):
+            notify(alert)
+
+    def do_GET(self):
+        # For `curl host:9099/` when you're wondering if it's alive.
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"alertmanager-notify ok\n")
+
+    def log_message(self, fmt, *args):
+        # journalctl already timestamps; the default handler double-stamps.
+        print(fmt % args, flush=True)
+
+
+if __name__ == "__main__":
+    server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
+    print(f"listening on {LISTEN_HOST}:{LISTEN_PORT}", flush=True)
+    server.serve_forever()

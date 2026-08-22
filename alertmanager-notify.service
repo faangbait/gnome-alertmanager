@@ -1,0 +1,23 @@
+[Unit]
+Description=Alertmanager desktop notifications
+# graphical-session.target, not default.target: notify-send needs a session
+# bus with a notification daemon on it. Starting earlier just fails quietly.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/alertmanager-notify
+Restart=on-failure
+RestartSec=5s
+
+# Uncomment to require a shared secret, and set a matching `authorization`
+# block on the Alertmanager webhook_configs entry.
+# Environment=ALERT_NOTIFY_TOKEN=...
+
+# Listen address and port, if the defaults don't suit.
+# Environment=ALERT_NOTIFY_HOST=0.0.0.0
+# Environment=ALERT_NOTIFY_PORT=9099
+
+[Install]
+WantedBy=graphical-session.target
