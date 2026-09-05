@@ -68,16 +68,16 @@ receivers:
 
 ## Verify
 
-The daemon answers GET, so from wherever Alertmanager runs:
+The daemon answers GET, so from wherever it runs:
 
 ```shell
-curl http://<desktop-address>:9099/
+curl http://localhost:9099/
 ```
 
 To prove the whole path without waiting for something to break:
 
 ```shell
-curl -X POST http://<desktop-address>:9099/ -H 'Content-Type: application/json' -d '{
+curl -X POST http://localhost:9099/ -H 'Content-Type: application/json' -d '{
   "alerts": [{
     "status": "firing",
     "labels": {"alertname": "TestAlert", "severity": "critical", "instance": "host1"},
